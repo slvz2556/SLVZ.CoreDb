@@ -4,6 +4,26 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+	<Title>SLVZ Core Database</Title>
+	<Company>SLVZ</Company>
+	<Authors>SLVZ</Authors>
+	<Product>SLVZ Core Database</Product>
+	<AssemblyTitle>SLVZ Core Db</AssemblyTitle>
+	<AssemblyName>SLVZ.CoreDb</AssemblyName>
+	<PackageLicenseExpression>MIT</PackageLicenseExpression>
+	<PackageReadmeFile>README.md</PackageReadmeFile>
+	<Version>1.0.0</Version>
+	<AssemblyVersion>1.0.0</AssemblyVersion>
+	<FileVersion>1.0.0</FileVersion>
+	<PackageTags>C#, Database</PackageTags>
+	<Description>
+		Embedded local database for .NET (net8.0+, Windows / Android / anything). No dependencies.
+		Pages + B+Tree storage, attribute-based indexes, XOR-ed files, crash-safe (write-ahead log), thread-safe.
+	</Description>
   </PropertyGroup>
+
+<ItemGroup>
+	<None Include="README.md" Pack="true" PackagePath="\" />
+</ItemGroup>
 
 </Project>
