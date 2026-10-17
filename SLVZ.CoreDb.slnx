@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SLVZ.CoreDb.Test/SLVZ.CoreDb.Test.csproj" />
+  <Project Path="SLVZ.CoreDb/SLVZ.CoreDb.csproj" />
+</Solution>
