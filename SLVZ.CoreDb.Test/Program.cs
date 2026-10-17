@@ -4,55 +4,6 @@ using SLVZ.CoreDb;
 using SLVZ.CoreDb.Storage;
 
 
-using var db = new Ashkan();
-
-var u = new User
-{
-    Email = "ashkan@outlook.com",
-    Fullname = "Ashkan",
-    ID = Guid.NewGuid(),
-    Username = "SLVZ"
-};
-
-//db.Users.Insert(u);
-
-var a = db.Users.Where(x => x.Username.StartsWith("SL"));
-
-
-return 0;
-
-
-class Ashkan : CoreDbContext
-{
-    public override void Configuration()
-    {
-        Initialize(Path.Combine(Environment.CurrentDirectory));
-    }
-
-    public DataSet<User> Users => DataSet<User>();
-}
-
-
-class User
-{
-    [PrimaryKey]
-    public Guid ID { get; set; }
-
-    [Index(Unique = true)]
-    public string? Username { get; set; }
-
-
-    [Index(Unique = true)]
-    public string? Email { get; set; }
-
-    public string? Fullname { get; set; }
-}
-
-
-
-
-/*
-
 int failed = 0;
 void Check(bool ok, string name)
 {
@@ -202,7 +153,7 @@ using (var db = new CoreDatabase(dir))
 // ---------- 4. crash recovery ----------
 using (var db = new CoreDatabase(dir))
 {
-    //var notes = db.Table<Note>();
+    var notes = db.Table<Note>();
     //Pager.TestFailAfterWal = true;
     bool threw = Throws<IOException>(() => notes.Insert(new Note { Slug = "crash-me", Title = "survives" }));
     //Pager.TestFailAfterWal = false;
@@ -350,4 +301,3 @@ class NoInitCtx : CoreDbContext
 {
     public override void Configuration() { }
 }
-*/
