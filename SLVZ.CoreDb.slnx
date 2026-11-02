@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="SLVZ.CoreDb.Bench/SLVZ.CoreDb.Bench.csproj" Id="9f092ad5-294d-4528-97a4-7db395279c17" />
   <Project Path="SLVZ.CoreDb.Test/SLVZ.CoreDb.Test.csproj" />
   <Project Path="SLVZ.CoreDb/SLVZ.CoreDb.csproj" />
 </Solution>

@@ -206,6 +206,17 @@ internal sealed class BPlusTree
         }
     }
 
+    uint RightmostLeafId()
+    {
+        uint id = Root;
+        while (true)
+        {
+            var pg = _p.Read(id);
+            if (pg[0] == PageType.Leaf) return id;
+            id = Inner.Load(id, pg).Children[^1];
+        }
+    }
+
     // ================= values / overflow =================
 
     Entry MakeEntry(byte[] key, byte[] value)
@@ -332,6 +343,28 @@ internal sealed class BPlusTree
                 if (!visit(e.Key, ReadValue(e))) return;
             }
             id = leaf.Next;
+        }
+    }
+
+    /// <summary>Visits entries with from &lt;= key &lt; to in DESCENDING key order (walks the leaf chain backwards).
+    /// Return false from the visitor to stop.</summary>
+    public void ScanReverse(byte[]? from, byte[]? to, Func<byte[], byte[], bool> visit)
+    {
+        uint id = to == null ? RightmostLeafId() : FindLeafId(to);
+        bool first = true;
+        while (id != 0)
+        {
+            var leaf = Leaf.Load(id, _p.Read(id));
+            int i = leaf.Entries.Count - 1;
+            if (first && to != null) i = LowerBound(leaf.Entries, to, out _) - 1;
+            first = false;
+            for (; i >= 0; i--)
+            {
+                var e = leaf.Entries[i];
+                if (from != null && Cmp(e.Key, from) < 0) return;
+                if (!visit(e.Key, ReadValue(e))) return;
+            }
+            id = leaf.Prev;
         }
     }
 

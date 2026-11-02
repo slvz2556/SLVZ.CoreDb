@@ -124,40 +124,32 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
         return list;
     });
 
-    /// <summary>from &lt;= value &lt;= to through an [Index] property, ordered by that property.
+    /// <summary>Rows whose [Index] property is between <paramref name="from"/> and <paramref name="to"/> (both included), ordered by that property.
+    /// Only the index entries and rows that are really returned are read, so <paramref name="skip"/> / <paramref name="take"/> make paging cheap.
     /// (For strings longer than 128 bytes the bounds are approximate.)</summary>
-    public List<T> Range<TValue>(Expression<Func<T, TValue>> property, TValue from, TValue to) => RunRead(() =>
+    /// <param name="property">The indexed property, e.g. x =&gt; x.Date.</param>
+    /// <param name="from">Lowest value.</param>
+    /// <param name="to">Highest value.</param>
+    /// <param name="descending">true = from the highest value down.</param>
+    /// <param name="skip">How many matching rows to skip first.</param>
+    /// <param name="take">Maximum number of rows to return (null = all).</param>
+    public List<T> Range<TValue>(Expression<Func<T, TValue>> property, TValue from, TValue to,
+        bool descending = false, int skip = 0, int? take = null) => RunRead(() =>
     {
         var ix = GetIndex(property);
         var start = KeyEncoder.Trunc(KeyEncoder.Encode(from, ix.Prop.Type));
         var end = KeyEncoder.Successor(KeyEncoder.Trunc(KeyEncoder.Encode(to, ix.Prop.Type)));
-        var list = new List<T>();
-        _s.Indexes[ix.Prop.Name].Scan(start, end, (_, pk) =>
-        {
-            var data = _s.Primary.Get(pk);
-            if (data != null) list.Add(_e.Deserialize(data));
-            return true;
-        });
-        return list;
+        return ReadIndex(ix, start, end, descending, skip, take);
     });
 
-    /// <summary>Rows ordered by an [Index] property, with optional paging.</summary>
+    /// <summary>Rows ordered by an [Index] property, with paging. Reads only what it returns (plus the skipped index entries), so
+    /// <c>OrderedBy(x =&gt; x.Date, descending: true, take: 20)</c> is fast on millions of rows.</summary>
+    /// <param name="property">The indexed property, e.g. x =&gt; x.Date.</param>
+    /// <param name="descending">true = highest value first.</param>
+    /// <param name="skip">How many rows to skip first.</param>
+    /// <param name="take">Maximum number of rows to return (null = all).</param>
     public List<T> OrderedBy<TValue>(Expression<Func<T, TValue>> property, bool descending = false, int skip = 0, int? take = null) =>
-        RunRead(() =>
-        {
-            var ix = GetIndex(property);
-            var pks = new List<byte[]>();
-            _s.Indexes[ix.Prop.Name].Scan(null, null, (_, pk) => { pks.Add(pk); return true; });
-            if (descending) pks.Reverse();
-
-            var list = new List<T>();
-            foreach (var pk in pks.Skip(skip).Take(take ?? int.MaxValue))
-            {
-                var data = _s.Primary.Get(pk);
-                if (data != null) list.Add(_e.Deserialize(data));
-            }
-            return list;
-        });
+        RunRead(() => ReadIndex(GetIndex(property), null, null, descending, skip, take));
 
     // ===================== writes =====================
 
@@ -350,6 +342,28 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
         _s.Primary.Delete(pk);
         _s.Count--;
         return true;
+    }
+
+    /// <summary>Walks an index (forwards or backwards), skips <paramref name="skip"/> entries and loads at most <paramref name="take"/> rows.</summary>
+    List<T> ReadIndex(IndexMeta<T> ix, byte[]? start, byte[]? end, bool descending, int skip, int? take)
+    {
+        var list = new List<T>();
+        if (take is <= 0) return list;
+        if (skip < 0) throw new ArgumentOutOfRangeException(nameof(skip));
+
+        int skipped = 0;
+        bool Visit(byte[] _, byte[] pk)
+        {
+            if (skipped < skip) { skipped++; return true; }
+            var data = _s.Primary.Get(pk);
+            if (data != null) list.Add(_e.Deserialize(data));
+            return take == null || list.Count < take;
+        }
+
+        var tree = _s.Indexes[ix.Prop.Name];
+        if (descending) tree.ScanReverse(start, end, Visit);
+        else tree.Scan(start, end, Visit);
+        return list;
     }
 
     void CheckUnique(IndexMeta<T> ix, T entity, byte[] pk)
