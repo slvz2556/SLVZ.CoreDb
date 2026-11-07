@@ -28,13 +28,21 @@ internal sealed class BPlusTree
     const int OverflowCapacity = Pager.PageSize - OverflowHeader;
 
     readonly Pager _p;
+    readonly bool _committed;
     public uint Root { get; private set; }
 
-    public BPlusTree(Pager pager, uint root)
+    /// <summary>Opens the tree whose root page is <paramref name="root"/>.</summary>
+    /// <param name="pager">The page file.</param>
+    /// <param name="root">Root page of the tree.</param>
+    /// <param name="committed">true = a read-only view that sees only committed pages (used by readers).</param>
+    public BPlusTree(Pager pager, uint root, bool committed = false)
     {
         _p = pager;
         Root = root;
+        _committed = committed;
     }
+
+    byte[] Rd(uint id) => _committed ? _p.ReadCommitted(id) : _p.Read(id);
 
     public static BPlusTree Create(Pager pager)
     {
@@ -188,7 +196,7 @@ internal sealed class BPlusTree
         uint id = Root;
         while (true)
         {
-            var pg = _p.Read(id);
+            var pg = Rd(id);
             if (pg[0] == PageType.Leaf) return id;
             var n = Inner.Load(id, pg);
             id = n.Children[ChildIndex(n.Keys, key)];
@@ -200,7 +208,7 @@ internal sealed class BPlusTree
         uint id = Root;
         while (true)
         {
-            var pg = _p.Read(id);
+            var pg = Rd(id);
             if (pg[0] == PageType.Leaf) return id;
             id = BinaryPrimitives.ReadUInt32LittleEndian(pg.AsSpan(4));
         }
@@ -211,7 +219,7 @@ internal sealed class BPlusTree
         uint id = Root;
         while (true)
         {
-            var pg = _p.Read(id);
+            var pg = Rd(id);
             if (pg[0] == PageType.Leaf) return id;
             id = Inner.Load(id, pg).Children[^1];
         }
@@ -256,7 +264,7 @@ internal sealed class BPlusTree
         uint id = e.OverflowPage;
         while (id != 0)
         {
-            var pg = _p.Read(id);
+            var pg = Rd(id);
             uint next = BinaryPrimitives.ReadUInt32LittleEndian(pg.AsSpan(4));
             int len = BinaryPrimitives.ReadInt32LittleEndian(pg.AsSpan(8));
             Buffer.BlockCopy(pg, OverflowHeader, buf, off, len);
@@ -272,7 +280,7 @@ internal sealed class BPlusTree
         uint id = e.OverflowPage;
         while (id != 0)
         {
-            uint next = BinaryPrimitives.ReadUInt32LittleEndian(_p.Read(id).AsSpan(4));
+            uint next = BinaryPrimitives.ReadUInt32LittleEndian(Rd(id).AsSpan(4));
             _p.Free(id);
             id = next;
         }
@@ -283,7 +291,7 @@ internal sealed class BPlusTree
     public byte[]? Get(byte[] key)
     {
         uint id = FindLeafId(key);
-        var leaf = Leaf.Load(id, _p.Read(id));
+        var leaf = Leaf.Load(id, Rd(id));
         int i = LowerBound(leaf.Entries, key, out bool found);
         return found ? ReadValue(leaf.Entries[i]) : null;
     }
@@ -291,7 +299,7 @@ internal sealed class BPlusTree
     public bool Contains(byte[] key)
     {
         uint id = FindLeafId(key);
-        var leaf = Leaf.Load(id, _p.Read(id));
+        var leaf = Leaf.Load(id, Rd(id));
         LowerBound(leaf.Entries, key, out bool found);
         return found;
     }
@@ -318,7 +326,7 @@ internal sealed class BPlusTree
     public bool Delete(byte[] key)
     {
         uint id = FindLeafId(key);
-        var leaf = Leaf.Load(id, _p.Read(id));
+        var leaf = Leaf.Load(id, Rd(id));
         int i = LowerBound(leaf.Entries, key, out bool found);
         if (!found) return false;
         FreeOverflow(leaf.Entries[i]);
@@ -333,7 +341,7 @@ internal sealed class BPlusTree
         uint id = from == null ? LeftmostLeafId() : FindLeafId(from);
         while (id != 0)
         {
-            var leaf = Leaf.Load(id, _p.Read(id));
+            var leaf = Leaf.Load(id, Rd(id));
             int start = from == null ? 0 : LowerBound(leaf.Entries, from, out _);
             from = null;
             for (int i = start; i < leaf.Entries.Count; i++)
@@ -354,7 +362,7 @@ internal sealed class BPlusTree
         bool first = true;
         while (id != 0)
         {
-            var leaf = Leaf.Load(id, _p.Read(id));
+            var leaf = Leaf.Load(id, Rd(id));
             int i = leaf.Entries.Count - 1;
             if (first && to != null) i = LowerBound(leaf.Entries, to, out _) - 1;
             first = false;
@@ -376,7 +384,7 @@ internal sealed class BPlusTree
         while (stack.Count > 0)
         {
             uint id = stack.Pop();
-            var pg = _p.Read(id);
+            var pg = Rd(id);
             if (pg[0] == PageType.Leaf)
             {
                 foreach (var e in Leaf.Load(id, pg).Entries) FreeOverflow(e);
@@ -394,7 +402,7 @@ internal sealed class BPlusTree
 
     Split? InsertRec(uint id, byte[] key, byte[] value, out bool replaced)
     {
-        var pg = _p.Read(id);
+        var pg = Rd(id);
 
         if (pg[0] == PageType.Leaf)
         {

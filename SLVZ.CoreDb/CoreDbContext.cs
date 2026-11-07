@@ -44,6 +44,16 @@ public abstract class CoreDbContext : IDisposable
         return _db.Table<T>();
     }
 
+    /// <summary>Runs the action as ONE atomic transaction over all tables: everything is saved or nothing. See <see cref="CoreDatabase.Transaction"/>.</summary>
+    public void Transaction(Action action)
+    {
+        if (_db == null) throw new InvalidOperationException("Call Initialize(path) first.");
+        _db.Transaction(action);
+    }
+
+    /// <summary>Async version of <see cref="Transaction"/>.</summary>
+    public Task TransactionAsync(Action action, CancellationToken ct = default) => Task.Run(() => Transaction(action), ct);
+
     /// <summary>The full path of the database folder.</summary>
     public string? DirectoryPath => _db?.DirectoryPath;
 

@@ -1,10 +1,20 @@
 namespace SLVZ.CoreDb.Storage;
 
+/// <summary>The trees of a table as seen by one reader: either the committed state or the live transaction.</summary>
+internal sealed class TableView
+{
+    public BPlusTree Primary = null!;
+    public Dictionary<string, BPlusTree> Indexes = null!;
+    public long Count;
+}
+
 /// <summary>One table file: the primary B+Tree + one B+Tree per index, plus counters.</summary>
 internal sealed class TableStorage : IDisposable
 {
     readonly string _path;
     readonly CoreDbOptions _options;
+    readonly Func<Guid, bool>? _decision;
+    volatile TableView _committed = null!;
 
     public Pager Pager { get; private set; }
     public BPlusTree Primary { get; private set; } = null!;
@@ -12,11 +22,18 @@ internal sealed class TableStorage : IDisposable
     public long AutoIncrement;
     public long Count;
 
-    public TableStorage(string path, CoreDbOptions options)
+    /// <summary>State as of the last commit. Safe for readers: it only reads committed pages.</summary>
+    public TableView Committed => _committed;
+
+    /// <summary>State including the transaction in progress. Only the thread that owns the transaction may use it.</summary>
+    public TableView Live => new() { Primary = Primary, Indexes = Indexes, Count = Count };
+
+    public TableStorage(string path, CoreDbOptions options, Func<Guid, bool>? decision = null)
     {
         _path = path;
         _options = options;
-        Pager = new Pager(path, options);
+        _decision = decision;
+        Pager = new Pager(path, options, decision);
         try
         {
             if (Pager.Meta.Length == 0)
@@ -24,7 +41,11 @@ internal sealed class TableStorage : IDisposable
                 Primary = BPlusTree.Create(Pager);
                 Commit();
             }
-            else LoadMeta();
+            else
+            {
+                LoadMeta();
+                PublishCommitted();
+            }
         }
         catch
         {
@@ -67,13 +88,42 @@ internal sealed class TableStorage : IDisposable
         return ms.ToArray();
     }
 
-    public void Commit(bool force = false) => Pager.Commit(SerializeMeta(), force);
+    void PublishCommitted()
+    {
+        var idx = new Dictionary<string, BPlusTree>(Indexes.Count);
+        foreach (var kv in Indexes) idx[kv.Key] = new BPlusTree(Pager, kv.Value.Root, committed: true);
+        _committed = new TableView
+        {
+            Primary = new BPlusTree(Pager, Primary.Root, committed: true),
+            Indexes = idx,
+            Count = Count,
+        };
+    }
+
+    /// <summary>Single-table commit. The caller must keep readers out (DataSet holds its view lock).</summary>
+    public void Commit(bool force = false)
+    {
+        Pager.Commit(SerializeMeta(), force);
+        PublishCommitted();
+    }
+
+    /// <summary>Multi-table commit, step 1: log the transaction. Returns false if nothing changed.</summary>
+    public bool Prepare(Guid txId) => Pager.Prepare(SerializeMeta(), txId);
+
+    /// <summary>Multi-table commit, step 2: apply it to the file. The caller must keep readers out.</summary>
+    public void Apply()
+    {
+        Pager.Apply();
+        PublishCommitted();
+    }
 
     public void Rollback()
     {
-        Pager.Rollback();
+        Pager.Abort();
         LoadMeta();
     }
+
+    public void MarkFaulted() => Pager.MarkFaulted();
 
     /// <summary>Makes the set of index trees match <paramref name="wanted"/>. Returns the newly created (empty) ones.</summary>
     public List<string> SyncIndexes(IEnumerable<string> wanted)
@@ -106,7 +156,7 @@ internal sealed class TableStorage : IDisposable
         Count = 0;
     }
 
-    /// <summary>Rebuilds the file without dead space. Must not run inside a transaction.</summary>
+    /// <summary>Rebuilds the file without dead space. Must not run inside a transaction; the caller keeps everybody out.</summary>
     public void Compact()
     {
         var tmp = _path + ".compact";
@@ -133,8 +183,9 @@ internal sealed class TableStorage : IDisposable
         }
         finally
         {
-            Pager = new Pager(_path, _options);
+            Pager = new Pager(_path, _options, _decision);
             LoadMeta();
+            PublishCommitted();
         }
     }
 

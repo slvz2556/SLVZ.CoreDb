@@ -5,20 +5,24 @@ using SLVZ.CoreDb.Storage;
 namespace SLVZ.CoreDb;
 
 /// <summary>
-/// A table of <typeparamref name="T"/> rows (one file). Thread-safe: many readers run in parallel; writers are exclusive.
-/// Every write method is one atomic, crash-safe transaction. Use <see cref="Transaction"/> to group several.
+/// A table of <typeparamref name="T"/> rows (one file). Thread-safe.
+/// Readers never wait for a writer's transaction: they see the last committed state and only pause for the moment the
+/// writer applies its commit. Every write method is one atomic, crash-safe transaction. Use <see cref="Transaction"/> to group several
+/// writes of this table and <see cref="CoreDatabase.Transaction"/> to group writes of several tables.
 /// </summary>
-public sealed class DataSet<T> : IDisposable where T : class, new()
+public sealed partial class DataSet<T> : ITable where T : class, new()
 {
     readonly TableStorage _s;
     readonly EntityInfo<T> _e = EntityInfo<T>.Instance;
-    readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.SupportsRecursion);
+    readonly string _name = typeof(T).Name;
+    readonly object _txLock = new();                                              // one writer transaction at a time
+    readonly ReaderWriterLockSlim _view = new(LockRecursionPolicy.SupportsRecursion); // readers vs. the short "apply commit" step
     int _depth;
     bool _failed;
 
-    internal DataSet(string path, CoreDbOptions options)
+    internal DataSet(string path, CoreDbOptions options, Func<Guid, bool>? decision)
     {
-        _s = new TableStorage(path, options);
+        _s = new TableStorage(path, options, decision);
         try
         {
             RunWrite(() =>
@@ -38,84 +42,46 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
     // ===================== reads =====================
 
     /// <summary>Number of rows in the table (instant, no scan).</summary>
-    public long Count => RunRead(() => _s.Count);
+    public long Count => RunRead(v => v.Count);
 
     /// <summary>Returns the row with this primary key, or null if there is none. Very fast (one B+Tree lookup).</summary>
     /// <param name="key">The primary key value (an int, string, Guid... matching the key property).</param>
-    public T? Find(object key) => RunRead(() =>
+    public T? Find(object key) => RunRead(v =>
     {
-        var data = _s.Primary.Get(PkBytes(key));
+        var data = v.Primary.Get(PkBytes(key));
         return data == null ? null : _e.Deserialize(data);
     });
 
     /// <summary>Checks whether a row with this primary key exists, without loading it.</summary>
-    public bool Exists(object key) => RunRead(() => _s.Primary.Contains(PkBytes(key)));
+    public bool Exists(object key) => RunRead(v => v.Primary.Contains(PkBytes(key)));
 
     /// <summary>Returns every row ordered by primary key. It loads the whole table into memory, so on big tables prefer Where / Range / OrderedBy(take: ...).</summary>
     public List<T> GetAll() => FullScan(_ => true);
 
     /// <summary>Always scans every row (no index). Takes a plain delegate, so it can run any C# code.</summary>
-    public List<T> FullScan(Func<T, bool> predicate) => RunRead(() =>
+    public List<T> FullScan(Func<T, bool> predicate) => RunRead(v =>
     {
         var list = new List<T>();
-        _s.Primary.Scan(null, null, (_, v) =>
+        v.Primary.Scan(null, null, (_, val) =>
         {
-            var e = _e.Deserialize(v);
+            var e = _e.Deserialize(val);
             if (predicate(e)) list.Add(e);
             return true;
         });
         return list;
     });
 
-    /// <summary>
-    /// Filters rows with a C# lambda. Conditions joined by &amp;&amp; that compare an [Index] / primary-key property
-    /// with ==, &gt;, &gt;=, &lt;, &lt;= are answered through the B+Tree; the full lambda is then applied to the
-    /// candidates, so any other condition still works. Without a usable condition (or with ||) it scans all rows.
-    /// Rows come back in index order when an index was used.
-    /// </summary>
-    public List<T> Where(Expression<Func<T, bool>> predicate) => RunRead(() =>
-    {
-        var plan = Plan(predicate);
-        // few candidates (index used): the interpreter starts instantly; full scan: real compiled IL is faster per row
-        var test = predicate.Compile(preferInterpretation: plan != null);
-        var list = new List<T>();
-        void Visit(byte[] data)
-        {
-            var e = _e.Deserialize(data);
-            if (test(e)) list.Add(e);
-        }
-
-        if (plan is not { } p)
-        {
-            _s.Primary.Scan(null, null, (_, v) => { Visit(v); return true; });
-        }
-        else if (p.Tree == null)
-        {
-            _s.Primary.Scan(p.Start, p.End, (_, v) => { Visit(v); return true; });
-        }
-        else
-        {
-            p.Tree.Scan(p.Start, p.End, (_, pk) =>
-            {
-                var data = _s.Primary.Get(pk);
-                if (data != null) Visit(data);
-                return true;
-            });
-        }
-        return list;
-    });
-
     /// <summary>Finds all rows whose [Index] property equals <paramref name="value"/>. Throws if the property has no [Index]. For simple conditions this is the lightest way to query.</summary>
     /// <param name="property">The indexed property, e.g. x =&gt; x.Slug.</param>
     /// <param name="value">The value to look for (null is allowed).</param>
-    public List<T> FindBy<TValue>(Expression<Func<T, TValue>> property, TValue value) => RunRead(() =>
+    public List<T> FindBy<TValue>(Expression<Func<T, TValue>> property, TValue value) => RunRead(v =>
     {
         var ix = GetIndex(property);
         var prefix = KeyEncoder.Trunc(KeyEncoder.Encode(value, ix.Prop.Type));
         var list = new List<T>();
-        _s.Indexes[ix.Prop.Name].Scan(prefix, KeyEncoder.Successor(prefix), (_, pk) =>
+        v.Indexes[ix.Prop.Name].Scan(prefix, KeyEncoder.Successor(prefix), (_, pk) =>
         {
-            var data = _s.Primary.Get(pk);
+            var data = v.Primary.Get(pk);
             if (data == null) return true;
             var e = _e.Deserialize(data);
             if (Equals(ix.Prop.Get(e), value)) list.Add(e);
@@ -134,12 +100,12 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
     /// <param name="skip">How many matching rows to skip first.</param>
     /// <param name="take">Maximum number of rows to return (null = all).</param>
     public List<T> Range<TValue>(Expression<Func<T, TValue>> property, TValue from, TValue to,
-        bool descending = false, int skip = 0, int? take = null) => RunRead(() =>
+        bool descending = false, int skip = 0, int? take = null) => RunRead(v =>
     {
         var ix = GetIndex(property);
         var start = KeyEncoder.Trunc(KeyEncoder.Encode(from, ix.Prop.Type));
         var end = KeyEncoder.Successor(KeyEncoder.Trunc(KeyEncoder.Encode(to, ix.Prop.Type)));
-        return ReadIndex(ix, start, end, descending, skip, take);
+        return ReadIndex(v, ix, start, end, descending, skip, take);
     });
 
     /// <summary>Rows ordered by an [Index] property, with paging. Reads only what it returns (plus the skipped index entries), so
@@ -149,7 +115,21 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
     /// <param name="skip">How many rows to skip first.</param>
     /// <param name="take">Maximum number of rows to return (null = all).</param>
     public List<T> OrderedBy<TValue>(Expression<Func<T, TValue>> property, bool descending = false, int skip = 0, int? take = null) =>
-        RunRead(() => ReadIndex(GetIndex(property), null, null, descending, skip, take));
+        RunRead(v => ReadIndex(v, GetIndex(property), null, null, descending, skip, take));
+
+    /// <summary>The smallest value of an [Index] or [PrimaryKey] property (null values are ignored), read straight from the index. Throws if there is no such row.</summary>
+    public TValue Min<TValue>(Expression<Func<T, TValue>> property) =>
+        TryMin(property, out var value) ? value : throw new InvalidOperationException("The table has no rows with a value for this property.");
+
+    /// <summary>The largest value of an [Index] or [PrimaryKey] property (null values are ignored), read straight from the index. Throws if there is no such row.</summary>
+    public TValue Max<TValue>(Expression<Func<T, TValue>> property) =>
+        TryMax(property, out var value) ? value : throw new InvalidOperationException("The table has no rows with a value for this property.");
+
+    /// <summary>Like <see cref="Min{TValue}"/> but returns false instead of throwing when there are no rows.</summary>
+    public bool TryMin<TValue>(Expression<Func<T, TValue>> property, out TValue value) => TryEdge(property, false, out value);
+
+    /// <summary>Like <see cref="Max{TValue}"/> but returns false instead of throwing when there are no rows.</summary>
+    public bool TryMax<TValue>(Expression<Func<T, TValue>> property, out TValue value) => TryEdge(property, true, out value);
 
     // ===================== writes =====================
 
@@ -157,7 +137,8 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
     /// Throws <see cref="DuplicateKeyException"/> if the key exists and <see cref="UniqueConstraintException"/> if a unique index value is taken; nothing is changed in that case.</summary>
     public void Insert(T entity) => RunWrite(() => { InsertCore(entity); return 0; });
 
-    /// <summary>Adds many rows in ONE transaction: all are saved or none (if one fails). Much faster than calling Insert in a loop because the disk is synced once.</summary>
+    /// <summary>Adds many rows in ONE transaction: all are saved or none (if one fails). Much faster than calling Insert in a loop because the disk is synced once.
+    /// For huge imports (millions of rows) call it in batches of about 10,000 rows: a transaction keeps its changed pages in memory until it commits.</summary>
     public void InsertMany(IEnumerable<T> entities) => RunWrite(() =>
     {
         foreach (var e in entities) InsertCore(e);
@@ -250,7 +231,9 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
         return n;
     });
 
-    /// <summary>Runs several operations as ONE atomic transaction: if anything inside throws, every change made inside is rolled back. Calls to this table's methods inside the action join the transaction.</summary>
+    /// <summary>Runs several operations as ONE atomic transaction: if anything inside throws, every change made inside is rolled back. Calls to this table's methods inside the action join the transaction,
+    /// and reads inside it see the changes made so far. Other threads keep seeing the old data until the transaction commits.
+    /// To make several TABLES atomic together use <see cref="CoreDatabase.Transaction"/>.</summary>
     public void Transaction(Action action) => RunWrite(() => { action(); return 0; });
 
     /// <summary>Deletes ALL rows of the table (and its indexes). The file keeps its size until you call <see cref="Compact"/>.</summary>
@@ -259,24 +242,34 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
     /// <summary>Rewrites the file without dead space (after many deletes). Blocks other threads while running.</summary>
     public void Compact()
     {
-        _lock.EnterWriteLock();
+        Monitor.Enter(_txLock);
         try
         {
-            if (_depth > 0) throw new InvalidOperationException("Compact can't run inside a transaction.");
-            _s.Compact();
+            _view.EnterWriteLock();
+            try
+            {
+                if (_depth > 0) throw new InvalidOperationException("Compact can't run inside a transaction.");
+                _s.Compact();
+            }
+            finally { _view.ExitWriteLock(); }
         }
-        finally { _lock.ExitWriteLock(); }
+        finally { Monitor.Exit(_txLock); }
     }
 
     /// <summary>Closes the table files. Normally you dispose the CoreDatabase / CoreDbContext instead.</summary>
     public void Dispose()
     {
-        _lock.EnterWriteLock();
-        try { _s.Dispose(); }
-        finally { _lock.ExitWriteLock(); }
+        Monitor.Enter(_txLock);
+        try
+        {
+            _view.EnterWriteLock();
+            try { _s.Dispose(); }
+            finally { _view.ExitWriteLock(); }
+        }
+        finally { Monitor.Exit(_txLock); }
     }
 
-    // ===================== internals =====================
+    // ===================== write internals =====================
 
     void InsertCore(T entity)
     {
@@ -344,28 +337,6 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
         return true;
     }
 
-    /// <summary>Walks an index (forwards or backwards), skips <paramref name="skip"/> entries and loads at most <paramref name="take"/> rows.</summary>
-    List<T> ReadIndex(IndexMeta<T> ix, byte[]? start, byte[]? end, bool descending, int skip, int? take)
-    {
-        var list = new List<T>();
-        if (take is <= 0) return list;
-        if (skip < 0) throw new ArgumentOutOfRangeException(nameof(skip));
-
-        int skipped = 0;
-        bool Visit(byte[] _, byte[] pk)
-        {
-            if (skipped < skip) { skipped++; return true; }
-            var data = _s.Primary.Get(pk);
-            if (data != null) list.Add(_e.Deserialize(data));
-            return take == null || list.Count < take;
-        }
-
-        var tree = _s.Indexes[ix.Prop.Name];
-        if (descending) tree.ScanReverse(start, end, Visit);
-        else tree.Scan(start, end, Visit);
-        return list;
-    }
-
     void CheckUnique(IndexMeta<T> ix, T entity, byte[] pk)
     {
         var value = ix.Prop.Get(entity);
@@ -422,185 +393,98 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
 
     byte[] PkBytes(object? key) => KeyEncoder.EncodePk(key, _e.Pk.Type);
 
-    IndexMeta<T> GetIndex<TValue>(Expression<Func<T, TValue>> selector)
-    {
-        Expression body = selector.Body;
-        if (body is UnaryExpression { NodeType: ExpressionType.Convert } u) body = u.Operand;
-        if (body is MemberExpression { Member: PropertyInfo p })
-            return _e.FindIndex(p.Name)
-                   ?? throw new InvalidOperationException($"{typeof(T).Name}.{p.Name} has no [Index] attribute.");
-        throw new ArgumentException("Select a single property, e.g. x => x.Title", nameof(selector));
-    }
+    // ===================== read internals =====================
 
-    // ---------- query planning for Where ----------
-
-    sealed class Bound
+    /// <summary>Walks an index (forwards or backwards), skips <paramref name="skip"/> entries and loads at most <paramref name="take"/> rows.</summary>
+    List<T> ReadIndex(TableView v, IndexMeta<T> ix, byte[]? start, byte[]? end, bool descending, int skip, int? take)
     {
-        public bool HasEq, HasLo, HasHi;
-        public object? Eq, Lo, Hi;
-    }
+        var list = new List<T>();
+        if (take is <= 0) return list;
+        if (skip < 0) throw new ArgumentOutOfRangeException(nameof(skip));
 
-    sealed class ParamFinder : ExpressionVisitor
-    {
-        readonly ParameterExpression _p;
-        public bool Found;
-        public ParamFinder(ParameterExpression p) => _p = p;
-        protected override Expression VisitParameter(ParameterExpression node)
+        int skipped = 0;
+        bool Visit(byte[] _, byte[] pk)
         {
-            if (node == _p) Found = true;
-            return node;
+            if (skipped < skip) { skipped++; return true; }
+            var data = v.Primary.Get(pk);
+            if (data != null) list.Add(_e.Deserialize(data));
+            return take == null || list.Count < take;
         }
+
+        var tree = v.Indexes[ix.Prop.Name];
+        if (descending) tree.ScanReverse(start, end, Visit);
+        else tree.Scan(start, end, Visit);
+        return list;
     }
 
-    (BPlusTree? Tree, byte[]? Start, byte[]? End)? Plan(Expression<Func<T, bool>> expr)
+    bool TryEdge<TValue>(Expression<Func<T, TValue>> property, bool descending, out TValue value)
     {
-        try
+        var name = PropName(property);
+        var row = RunRead(v => EdgeRow(v, name, descending));
+        if (row == null)
         {
-            var param = expr.Parameters[0];
-            var conjuncts = new List<Expression>();
-            SplitAnd(expr.Body, conjuncts);
-
-            var bounds = new Dictionary<string, Bound>();
-            foreach (var c in conjuncts)
-            {
-                if (!TryMatch(c, param, out var name, out var op, out var value)) continue;
-                if (name != _e.Pk.Name && _e.FindIndex(name) == null) continue;
-                if (!bounds.TryGetValue(name, out var b)) bounds[name] = b = new Bound();
-
-                switch (op)
-                {
-                    case ExpressionType.Equal: b.HasEq = true; b.Eq = value; break;
-                    case ExpressionType.GreaterThan or ExpressionType.GreaterThanOrEqual when value != null: b.HasLo = true; b.Lo = value; break;
-                    case ExpressionType.LessThan or ExpressionType.LessThanOrEqual when value != null: b.HasHi = true; b.Hi = value; break;
-                }
-            }
-
-            string? best = null;
-            int bestScore = int.MaxValue;
-            foreach (var (name, b) in bounds)
-            {
-                bool isPk = name == _e.Pk.Name;
-                int score;
-                if (b.HasEq) score = isPk ? 0 : _e.FindIndex(name)!.Unique ? 1 : 2;
-                else if (b.HasLo || b.HasHi) score = (isPk ? 3 : 5) + (b.HasLo && b.HasHi ? 0 : 1);
-                else continue;
-                if (score < bestScore) { bestScore = score; best = name; }
-            }
-            if (best == null) return null;
-
-            var bd = bounds[best];
-            bool pk = best == _e.Pk.Name;
-            var type = pk ? _e.Pk.Type : _e.FindIndex(best)!.Prop.Type;
-            byte[] Enc(object? v)
-            {
-                var e = KeyEncoder.Encode(v, type);
-                return pk ? e : KeyEncoder.Trunc(e);
-            }
-
-            var tree = pk ? null : _s.Indexes[best];
-            if (bd.HasEq)
-            {
-                var prefix = Enc(bd.Eq);
-                return (tree, prefix, KeyEncoder.Successor(prefix));
-            }
-            var start = bd.HasLo ? Enc(bd.Lo) : new byte[] { 1 };   // 0x00 = null values
-            var end = bd.HasHi ? KeyEncoder.Successor(Enc(bd.Hi)) : null;
-            return (tree, start, end);
+            value = default!;
+            return false;
         }
-        catch (Exception)
-        {
-            return null;   // can't plan it: scan everything, the lambda decides (and reports its own errors)
-        }
-    }
-
-    static void SplitAnd(Expression e, List<Expression> list)
-    {
-        if (e is BinaryExpression { NodeType: ExpressionType.AndAlso } b)
-        {
-            SplitAnd(b.Left, list);
-            SplitAnd(b.Right, list);
-        }
-        else list.Add(e);
-    }
-
-    static Expression Unwrap(Expression e) =>
-        e is UnaryExpression { NodeType: ExpressionType.Convert } u ? Unwrap(u.Operand) : e;
-
-    static bool TryMatch(Expression e, ParameterExpression param, out string name, out ExpressionType op, out object? value)
-    {
-        name = ""; op = default; value = null;
-        if (e is not BinaryExpression b) return false;
-        if (b.NodeType is not (ExpressionType.Equal or ExpressionType.GreaterThan or ExpressionType.GreaterThanOrEqual
-            or ExpressionType.LessThan or ExpressionType.LessThanOrEqual)) return false;
-
-        var left = Unwrap(b.Left);
-        var right = Unwrap(b.Right);
-        Expression valueExpr;
-        if (IsParamProperty(left, param, out name) && !Uses(right, param)) { valueExpr = right; op = b.NodeType; }
-        else if (IsParamProperty(right, param, out name) && !Uses(left, param)) { valueExpr = left; op = Flip(b.NodeType); }
-        else return false;
-
-        value = Eval(valueExpr);
+        value = (TValue)_e.FindProp(name)!.Get(row)!;
         return true;
     }
 
-    // constants and captured variables (closure fields) are read by reflection; anything else is interpreted
-    static object? Eval(Expression e)
+    T? EdgeRow(TableView v, string name, bool descending)
     {
-        switch (e)
+        var nonNull = new byte[] { 1 };   // keys of null values start with 0
+        if (name == _e.Pk.Name)
         {
-            case ConstantExpression c:
-                return c.Value;
-            case MemberExpression { Expression: null } m:
-                return m.Member is FieldInfo sf ? sf.GetValue(null) : ((PropertyInfo)m.Member).GetValue(null);
-            case MemberExpression { Expression: { } inner } m when !HasCall(inner):
-                var target = Eval(inner);
-                return m.Member is FieldInfo f ? f.GetValue(target) : ((PropertyInfo)m.Member).GetValue(target);
-            default:
-                return Expression.Lambda<Func<object?>>(Expression.Convert(e, typeof(object))).Compile(preferInterpretation: true)();
+            T? found = null;
+            bool Visit(byte[] _, byte[] val) { found = _e.Deserialize(val); return false; }
+            if (descending) v.Primary.ScanReverse(nonNull, null, Visit);
+            else v.Primary.Scan(nonNull, null, Visit);
+            return found;
         }
+
+        var ix = _e.FindIndex(name)
+                 ?? throw new InvalidOperationException($"{typeof(T).Name}.{name} has no [Index] attribute.");
+        var rows = ReadIndex(v, ix, nonNull, null, descending, 0, 1);
+        return rows.Count == 0 ? null : rows[0];
     }
 
-    static bool HasCall(Expression e) => e is not (ConstantExpression or MemberExpression { Expression: null })
-        && !(e is MemberExpression me && !HasCall(me.Expression!));
-
-    static bool IsParamProperty(Expression e, ParameterExpression param, out string name)
+    static string PropName<TValue>(Expression<Func<T, TValue>> selector)
     {
-        if (e is MemberExpression { Member: PropertyInfo p, Expression: ParameterExpression pe } && pe == param)
-        {
-            name = p.Name;
-            return true;
-        }
-        name = "";
-        return false;
+        Expression body = selector.Body;
+        if (body is UnaryExpression { NodeType: ExpressionType.Convert } u) body = u.Operand;
+        if (body is MemberExpression { Member: PropertyInfo p }) return p.Name;
+        throw new ArgumentException("Select a single property, e.g. x => x.Title", nameof(selector));
     }
 
-    static bool Uses(Expression e, ParameterExpression param)
+    IndexMeta<T> GetIndex<TValue>(Expression<Func<T, TValue>> selector)
     {
-        var f = new ParamFinder(param);
-        f.Visit(e);
-        return f.Found;
+        var name = PropName(selector);
+        return _e.FindIndex(name)
+               ?? throw new InvalidOperationException($"{typeof(T).Name}.{name} has no [Index] attribute.");
     }
 
-    static ExpressionType Flip(ExpressionType t) => t switch
-    {
-        ExpressionType.GreaterThan => ExpressionType.LessThan,
-        ExpressionType.GreaterThanOrEqual => ExpressionType.LessThanOrEqual,
-        ExpressionType.LessThan => ExpressionType.GreaterThan,
-        ExpressionType.LessThanOrEqual => ExpressionType.GreaterThanOrEqual,
-        _ => t,
-    };
+    // ===================== locking / transactions =====================
 
-    TResult RunRead<TResult>(Func<TResult> f)
+    /// <summary>Readers use the last committed state. A thread that is inside its own transaction on this table sees its own changes instead.</summary>
+    TResult RunRead<TResult>(Func<TableView, TResult> f)
     {
-        _lock.EnterReadLock();
-        try { return f(); }
-        finally { _lock.ExitReadLock(); }
+        if (Monitor.IsEntered(_txLock)) return f(_s.Live);
+
+        _view.EnterReadLock();
+        try { return f(_s.Committed); }
+        finally { _view.ExitReadLock(); }
+    }
+
+    void CommitLocal()
+    {
+        _view.EnterWriteLock();     // only for the short "apply" step: waits for readers that are mid-read, blocks new ones
+        try { _s.Commit(); }
+        finally { _view.ExitWriteLock(); }
     }
 
     TResult RunWrite<TResult>(Func<TResult> f)
     {
-        _lock.EnterWriteLock();
+        Monitor.Enter(_txLock);
         try
         {
             _depth++;
@@ -615,7 +499,7 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
                         _s.Rollback();
                         throw new InvalidOperationException("The transaction was rolled back because an operation inside it failed.");
                     }
-                    _s.Commit();
+                    CommitLocal();
                 }
                 return result;
             }
@@ -631,6 +515,48 @@ public sealed class DataSet<T> : IDisposable where T : class, new()
             }
             finally { _depth--; }
         }
-        finally { _lock.ExitWriteLock(); }
+        finally { Monitor.Exit(_txLock); }
+    }
+
+    // ----- multi-table transactions (driven by CoreDatabase.Transaction) -----
+
+    string ITable.Name => _name;
+
+    void ITable.BeginMulti()
+    {
+        Monitor.Enter(_txLock);
+        if (_depth > 0)
+        {
+            Monitor.Exit(_txLock);
+            throw new InvalidOperationException("A database transaction can't start inside a transaction of a single table.");
+        }
+        _depth = 1;          // inner operations see depth >= 2 and therefore never commit on their own
+        _failed = false;
+    }
+
+    bool ITable.HasFailed => _failed;
+
+    bool ITable.Prepare(Guid txId) => _s.Prepare(txId);
+
+    void ITable.Apply()
+    {
+        _view.EnterWriteLock();
+        try { _s.Apply(); }
+        finally { _view.ExitWriteLock(); }
+    }
+
+    void ITable.Abort()
+    {
+        _failed = false;
+        _s.Rollback();
+    }
+
+    void ITable.Fault() => _s.MarkFaulted();
+
+    void ITable.EndMulti()
+    {
+        _depth = 0;
+        _failed = false;
+        Monitor.Exit(_txLock);
     }
 }

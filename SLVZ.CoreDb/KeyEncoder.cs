@@ -32,6 +32,25 @@ internal static class KeyEncoder
         return enc;
     }
 
+    /// <summary>Encoding of a string PREFIX (no terminator), so every encoded string starting with it starts with these bytes.</summary>
+    public static byte[] EncodePrefix(string prefix)
+    {
+        var b = new List<byte>(prefix.Length + 2) { 1 };
+        foreach (var x in Encoding.UTF8.GetBytes(prefix))
+        {
+            b.Add(x);
+            if (x == 0) b.Add(0xFF);
+        }
+        return Trunc(b.ToArray());
+    }
+
+    /// <summary>true if equal values always produce equal keys and vice versa (floating point and decimal don't).</summary>
+    public static bool IsExactType(Type type)
+    {
+        var u = Nullable.GetUnderlyingType(type) ?? type;
+        return u != typeof(float) && u != typeof(double) && u != typeof(decimal);
+    }
+
     public static byte[] Trunc(byte[] enc) =>
         enc.Length <= MaxIndexValueBytes ? enc : enc[..MaxIndexValueBytes];
 

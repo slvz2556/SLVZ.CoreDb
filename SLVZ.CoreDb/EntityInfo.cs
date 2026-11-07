@@ -153,6 +153,9 @@ internal sealed class EntityInfo<T> where T : class, new()
         _byHash = Stored.ToDictionary(x => x.Hash);
     }
 
+    public PropMeta<T>? FindProp(string propertyName) =>
+        Stored.FirstOrDefault(p => p.Name == propertyName);
+
     public IndexMeta<T>? FindIndex(string propertyName) =>
         Indexes.FirstOrDefault(i => i.Prop.Name == propertyName);
 
